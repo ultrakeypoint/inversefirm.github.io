@@ -54,20 +54,20 @@ jobs:
         with:
           path: website/build
 
-  deploy:
-    name: Deploy to GitHub Pages
-    needs: build
+  # deploy:
+  #   name: Deploy to GitHub Pages
+  #   needs: build
 
-    permissions:
-      pages: write
-      id-token: write
+  #   permissions:
+  #     pages: write
+  #     id-token: write
 
-    environment:
-      name: gh-pages
-      url: ${{ steps.deployment.outputs.page_url }}
+  #   environment:
+  #     name: gh-pages
+  #     url: ${{ steps.deployment.outputs.page_url }}
 
-    runs-on: ubuntu-latest
-    steps:
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v4
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - name: Deploy to GitHub Pages
+  #       id: deployment
+  #       uses: actions/deploy-pages@v4

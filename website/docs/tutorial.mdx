@@ -1,0 +1,203 @@
+---
+sidebar_position: 2
+---
+
+# Tutorial
+
+This tutorial demonstrates how to use the In-Process SDK of LLMBoost so that you can integrated it into your own application.
+
+:::tip Only interested in the Inference Server?
+
+If you plan on using LLMBoost only as an inference server feel free to skip straight to [Inference Server](./inference-server.md)
+
+:::
+
+
+If you are using one of the Cloud-based LLMBoost images the contents of the code listings can be found in `tutorial.py`.
+
+First we import the relevant packages: 
+
+```python
+# Copyright 2024, MangoBoost, Inc. All rights reserved.
+
+import pickle
+import time
+
+from llmboost import LLMBoost
+
+import evaluate
+import nltk
+from transformers import AutoTokenizer
+from tqdm import tqdm
+
+import numpy as np
+
+from absl import app
+```
+
+The LLMBoost runtime is imported using `from llmboost import LLMBoost`.
+
+The tutorial is an `absl` application leveraging the LLMBoost runtime which performs text completion.
+The inputs and expected outputs are taken from the open ORCA dataset.
+At the end of inference the ROUGE score is calculated for the 1000 samples.
+As standard in `absl` applications we start with `main` and `__main__` declarations:
+
+```python
+def main(_):
+    ...
+
+if __name__ == "__main__":
+    app.run(main)
+```
+
+:::tip Simple Example
+
+All of the code from this point on is placed in the `def main(_)` function.
+
+:::
+
+This snippet below reads a pre-processed version of the open ORCA dataset (saved in a `pkl` file) and extracts the system and user prompts in addition to the expected results. 
+If you are interested in how the dataset was processed please refer to [this resource](https://github.com/mlcommons/inference/tree/master/language/llama2-70b#unprocessed).
+
+```python
+# The dataset is a pickled pandas DataFrame with the following columns:
+# - system_prompt: A system-generated prompt.
+# - question: A user-generated question.
+# - output: The reference answer to the question.
+dataset_path = "./llama2_data.pkl"
+
+with open(dataset_path, "rb") as f:
+    dataset = pickle.load(f)
+
+source_texts = []
+for _, row in dataset.iterrows():
+    system = row.get("system_prompt", None)
+    user = row.get("question", None)
+    source_texts.append({"system": system, "user": user})
+
+target_texts = dataset["output"].tolist()
+print(f"Loaded dataset with {len(source_texts)} samples")
+```
+
+Now it is time to setup the LLMBoost runtime.
+LLMBoost is an optimized inference runtime that exposes multiple levels of parallelism.
+By default LLMBoost to try to determine the best parallelism to maximize throughput, however Data Parallelism and Tensor Parallelism can be control directly, please refer to the API documentation on how to do this.
+For additional information on Data Parallelism and Tensor Parallelism please refer to the section on [Parallelism](./parallelism.md)
+
+In this snippet we name our target model, in this case `microsoft/Phi-3-mini-4k-instruct`, and specify the `max_tokens` we want to generate.
+Finally we call `llmboost.start()` to prepare the runtime to start accepting inference requests.
+
+```python
+model_name = "microsoft/Phi-3-mini-4k-instruct"
+
+# Instantiate LLMBoost with the specified parameters.
+llmboost = LLMBoost(model_name=model_name, max_tokens=1024)
+
+# Start the LLMBoost runtime.
+llmboost.start()
+```
+
+:::tip HuggingFace or Local
+
+LLMBoost supports loading models in multiple formats including download models directly from [HuggingFace](https://huggingface.co/).
+
+:::
+
+
+Now that the LLMBoost runtime has been started we can format the inputs and issue them to the LLMBoost runtime.
+In the case of the Open ORCA dataset there is a `system` and `user` message and the exact format of of these prompts often depends on the particular model.
+LLMBoost attempts apply the model specific format with `llmboost.apply_format(...)`, alternatively a user can build their own format and submit the requests as a list of requests (`List[Dict[int, str]]`).
+Since LLMBoost is design for streaming LLM Inference there are separate thread-safe function calls for issuing requests and collecting results.
+In a production environment we recommend using different threads for issuing and collecting. 
+The `llmboost.get_output()` function is blocking request that will sleep until data is available.
+For more information on the specifics, please refer to the [API documentation](./api/llmboost.md).
+
+```python
+num_prompts = 1000
+
+# The apply_format function formats the input text segments into the required format.
+inputs = []
+for i, p in enumerate(source_texts[:num_prompts]):
+    inputs.append(
+        llmboost.apply_format(
+            [
+                {"role": "system", "content": p["system"]},
+                {"role": "user", "content": p["user"]},
+            ]
+        )
+    )
+
+    # Assign an id to each input for tracking the output.
+    inputs[-1]["id"] = i
+
+# Issue the inputs to LLMBoost.
+# The input format is a list of dictionaries with the following keys:
+# - id: A unique identifier for the input.
+# - val: The input text.
+llmboost.issues_inputs(inputs)
+```
+
+This next snippet collects the results from LLMBoost as they become available.
+LLMBoost supports streaming of incomplete results, this tutorial doesn't cover this aspect so please refer to the API documentation if you are interested.
+
+```python
+# Query LLMBoost for the outputs.
+# The outputs are returned as a list of dictionaries with the following keys:
+# - id: The unique identifier of the input.
+# - val: The output text.
+# - finished: A flag indicating if the output is complete. (Only relevant for streaming mode)
+preds = {}
+out_count = 0
+while out_count < len(inputs):
+    outputs = llmboost.get_output()
+    for q in outputs:
+        preds[q["id"]] = q["val"]
+        out_count += 1
+```
+
+Now that all of the results have been collected we can stop the runtime.
+
+```python
+llmboost.stop()
+```
+    
+
+:::tip Performance
+
+The `tutorial.py` provided with the LLMBoost release also has additional code to measure performance, this has been left out to only focus on the parts relevant to run LLMBoost.
+
+:::
+
+This final section compares the output of LLMBoost to the expected output and calculates the ROUGE score.
+
+```python
+# Sort the outputs based on the id.
+preds = [preds[key] for key in sorted(preds.keys(), reverse=False)]
+
+# Calculate the ROUGE scores.
+nltk.download("punkt", quiet=True)
+nltk.download("punkt_tab", quiet=True)
+metric = evaluate.load("rouge")
+
+# Do some postprocessing to the texts.
+preds = [pred.strip() for pred in preds]
+target_texts = [target.strip() for target in target_texts[0 : len(preds)]]
+
+# rogueLSum expects newline after each sentence.
+preds = ["\n".join(nltk.sent_tokenize(pred)) for pred in preds]
+target_texts = ["\n".join(nltk.sent_tokenize(target)) for target in target_texts]
+
+# Calculate the ROUGE scores.
+result = metric.compute(
+    predictions=preds,
+    references=target_texts,
+    use_stemmer=True,
+    use_aggregator=False,
+)
+result = {k: round(np.mean(v) * 100, 4) for k, v in result.items()}
+
+print(f"ROUGE1: {result['rouge1']}")
+print(f"ROUGE2: {result['rouge2']}")
+print(f"ROUGEL: {result['rougeL']}")
+print(f"ROUGELsum: {result['rougeLsum']}")
+```
